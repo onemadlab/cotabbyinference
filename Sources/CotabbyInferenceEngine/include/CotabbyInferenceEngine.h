@@ -86,6 +86,29 @@ public:
     // then report `logprob == 0`.
     void setComputeLogprob(int32_t sequence_id, bool enabled);
 
+    // Additive per-token logit biases applied to every subsequent generation until replaced or
+    // cleared. Intended for personalization: a caller that knows which tokens this user favors
+    // (from their own typing history) can nudge the distribution toward them without changing the
+    // prompt, which is both cheaper than re-tokenizing a vocabulary list into every request and
+    // more precise, since it acts on the distribution rather than on the model's interpretation of
+    // an instruction.
+    //
+    // `biases` are in logit space and added before temperature and top-k/top-p, so a biased token
+    // can survive truncation it would otherwise be cut by. Positive favors, negative disfavors.
+    // Magnitudes are the caller's policy; small values (well under 1.0) shift word choice subtly,
+    // while large ones will start overriding fit.
+    //
+    // Engine-level rather than per-sequence: the product owns exactly one live sequence, and the
+    // bias describes the user, not a particular editing session. Applying it at sampler-build time
+    // means it survives sequence resets without the caller re-arming it.
+    //
+    // `tokens` and `biases` are parallel arrays of length `count`, copied before returning; the
+    // caller may free them immediately. Passing count == 0 is equivalent to clearing.
+    void setPersonalizationBias(const int32_t* tokens, const float* biases, int count);
+
+    // Drops any personalization bias. Equivalent to setPersonalizationBias(nullptr, nullptr, 0).
+    void clearPersonalizationBias();
+
     // Cancellation (thread-safe, non-blocking)
     void cancelSequence(int32_t sequence_id);
 

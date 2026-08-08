@@ -155,6 +155,12 @@ struct CotabbyInferenceEngine::Impl {
     std::vector<llama_logit_bias> linebreak_bias;
     std::vector<bool> starts_new_word;
 
+    // Caller-supplied personalization biases (see setPersonalizationBias). Unlike the two masks
+    // above these are finite and additive rather than -inf, and they are rebuilt by the caller
+    // rather than by buildTokenMasks, so they deliberately survive model reloads: the user's
+    // vocabulary does not change because a different GGUF was selected.
+    std::vector<llama_logit_bias> personalization_bias;
+
     // One product sequence with a monotonically changing external identity. The mutex protects
     // create/destroy and lookup; callers still must not destroy the sequence while another method
     // is using the returned state pointer.
@@ -196,6 +202,24 @@ struct CotabbyInferenceEngine::Impl {
                 mask.data()
             );
             if (bias) llama_sampler_chain_add(chain, bias);
+        }
+
+        // Personalization sits in its own stage rather than being merged into `mask` above. Merging
+        // would let a finite positive bias share a vector whose contract is "-inf, absolute", and a
+        // caller-supplied entry for a token that is also masked would then depend on which of the
+        // two appeared later in the array. Kept separate, the mask stays unconditionally absolute
+        // and this stage only ever shifts tokens the mask already permits.
+        //
+        // Still ahead of temperature and top-k/top-p, so a favored token can survive truncation it
+        // would otherwise be cut by — which is the entire point, and also why an overlarge bias
+        // starts producing words that fit the user but not the sentence.
+        if (!personalization_bias.empty()) {
+            auto* personal = llama_sampler_init_logit_bias(
+                llama_vocab_n_tokens(vocab),
+                static_cast<int32_t>(personalization_bias.size()),
+                personalization_bias.data()
+            );
+            if (personal) llama_sampler_chain_add(chain, personal);
         }
 
         if (cfg.repetition_penalty > 1.0f) {
@@ -828,6 +852,29 @@ void CotabbyInferenceEngine::setComputeLogprob(int32_t sequence_id, bool enabled
     if (seq) {
         seq->compute_logprob = enabled;
     }
+}
+
+void CotabbyInferenceEngine::setPersonalizationBias(const int32_t* tokens, const float* biases, int count) {
+    if (!impl_) return;
+
+    // Copy rather than retain the caller's arrays: the sampler is rebuilt per generation, long
+    // after this call returns, and Swift's `withUnsafeBufferPointer` guarantees the pointers only
+    // for the duration of the call.
+    impl_->personalization_bias.clear();
+    if (!tokens || !biases || count <= 0) return;
+
+    impl_->personalization_bias.reserve(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        // A non-finite bias would poison the whole distribution and produce NaN logits rather than
+        // a visible error, so those entries are dropped here instead of at the sampler.
+        if (!std::isfinite(biases[i])) continue;
+        impl_->personalization_bias.push_back({ static_cast<llama_token>(tokens[i]), biases[i] });
+    }
+}
+
+void CotabbyInferenceEngine::clearPersonalizationBias() {
+    if (!impl_) return;
+    impl_->personalization_bias.clear();
 }
 
 // ---------------------------------------------------------------------------
